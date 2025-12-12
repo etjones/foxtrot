@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use memchr::{memchr, memchr_iter};
 use nom::{
     branch::{alt},
@@ -30,14 +32,14 @@ fn char<'a>(c: char) -> impl FnMut(&'a str) -> IResult<'a, char> {
 }
 
 /// Overloaded version of nom's `tag` that eats trailing whitespace
-fn tag<'a>(s: &'a str) -> impl FnMut(&'a str) -> IResult<&'a str> {
+fn tag<'a>(s: &'a str) -> impl FnMut(&'a str) -> IResult<'a, &'a str> {
     ws(nom::bytes::complete::tag(s))
 }
 
 /// Matches a specific keyword, which ensuring that it's not followed by
 /// a letter.  This avoids cases like `generic_expression` being parsed as
 /// `generic`, `_expression`.
-fn kw<'a>(s: &'a str) -> impl FnMut(&'a str) -> IResult<&'a str> {
+fn kw<'a>(s: &'a str) -> impl FnMut(&'a str) -> IResult<'a, &'a str> {
     ws(terminated(nom::bytes::complete::tag(s),
                   not(alt((letter, digit, char('_'))))))
 }
@@ -67,11 +69,20 @@ fn list1<'a, U, F>(c: char, p: F) -> impl FnMut(&'a str) -> IResult<'a, Vec<U>>
 /// lets you define them without as much boilerplate, with or without a
 /// separate parser function.
 macro_rules! alias {
-    ($a:ident $(< $lt:lifetime >)?, $b:ident) => {
+    ($a:ident < $lt:lifetime >, $b:ident) => {
         #[derive(Debug)]
-        pub struct $a $(< $lt >)?(pub $b $(< $lt >)?);
-        impl $(< $lt >)? $a $(< $lt >)?  {
-            fn parse(s: &$( $lt )? str) -> IResult<$( $lt, )? Self> {
+        pub struct $a<$lt>(pub $b<$lt>);
+        impl<$lt> $a<$lt> {
+            fn parse(s: &$lt str) -> IResult<$lt, Self> {
+                map($b::parse, Self)(s)
+            }
+        }
+    };
+    ($a:ident, $b:ident) => {
+        #[derive(Debug)]
+        pub struct $a(pub $b);
+        impl $a {
+            fn parse(s: &str) -> IResult<'_, Self> {
                 map($b::parse, Self)(s)
             }
         }
@@ -182,7 +193,7 @@ fn not_quote(s: &str) -> IResult<'_, char> {
 }
 
 // 136
-fn octet(s: &str) -> IResult<&str> {
+fn octet(s: &str) -> IResult<'_, &str> {
     recognize(pair(hex_digit, hex_digit))(s)
 }
 
@@ -220,7 +231,7 @@ fn real_literal(s: &str) -> IResult<'_, f64> {
 #[derive(Debug, Eq, PartialEq)]
 pub struct SimpleId<'a>(pub &'a str);
 impl<'a> SimpleId<'a> {
-    fn parse(s: &'a str) -> IResult<Self> {
+    fn parse(s: &'a str) -> IResult<'a, Self> {
         let r = ws(map(pair(
                 letter,
                 many0_count(alt((letter, digit, char('_'))))),
@@ -253,7 +264,7 @@ impl<'a> SimpleId<'a> {
         }
     }
 }
-fn simple_id(s: &str) -> IResult<SimpleId> { SimpleId::parse(s) }
+fn simple_id(s: &str) -> IResult<'_, SimpleId<'_>> { SimpleId::parse(s) }
 
 // 144 simple_string_literal = \q { ( \q \q ) | not_quote | \s | \x9 | \xA | \xD } \q .
 fn simple_string_literal(s: &str) -> IResult<'_, String> {
@@ -511,7 +522,7 @@ fn binary_type(s: &str) -> IResult<'_, BinaryType<'_>> {
 }
 
 // 182 boolean_type = BOOLEAN .
-fn boolean_type(s: &str) -> IResult<()> {
+fn boolean_type(s: &str) -> IResult<'_, ()> {
     map(kw("boolean"), |_| ())(s)
 }
 
@@ -929,7 +940,7 @@ pub struct ExplicitAttr<'a> {
     pub optional: bool,
     pub parameter_type: ParameterType<'a>,
 }
-fn explicit_attr(s: &str) -> IResult<ExplicitAttr> {
+fn explicit_attr(s: &str) -> IResult<'_, ExplicitAttr<'_>> {
     map(tuple((
         list1(',', attribute_decl),
         char(':'),
@@ -947,7 +958,7 @@ fn explicit_attr(s: &str) -> IResult<ExplicitAttr> {
 #[derive(Debug)]
 pub struct Expression<'a>(SimpleExpression<'a>, Option<(RelOpExtended, SimpleExpression<'a>)>);
 impl<'a> Expression<'a> {
-    fn parse(s: &'a str) -> IResult<Self> {
+    fn parse(s: &'a str) -> IResult<'a, Self> {
         let (s, a) = simple_expression(s)?;
         let (s, b) = opt(pair(rel_op_extended, simple_expression))(s)?;
         Ok((s, Self(a, b)))
@@ -1045,7 +1056,7 @@ pub enum GeneralizedTypes<'a> {
     GenericEntity(GenericEntityType<'a>),
     Generic(GenericType<'a>),
 }
-fn generalized_types(s: &str) -> IResult<GeneralizedTypes> {
+fn generalized_types(s: &str) -> IResult<'_, GeneralizedTypes<'_>> {
     use GeneralizedTypes::*;
     alt((
         map(aggregate_type, Aggregate),
@@ -1064,7 +1075,7 @@ pub enum GeneralAggregationTypes<'a> {
     List(GeneralListType<'a>),
     Set(GeneralSetType<'a>),
 }
-fn general_aggregation_types(s: &str) -> IResult<GeneralAggregationTypes> {
+fn general_aggregation_types(s: &str) -> IResult<'_, GeneralAggregationTypes<'_>> {
     use GeneralAggregationTypes::*;
     alt((
         map(general_array_type, Array),
@@ -1083,7 +1094,7 @@ pub struct GeneralArrayType<'a> {
     pub unique: bool,
     pub parameter_type: Box<ParameterType<'a>>,
 }
-fn general_array_type(s: &str) -> IResult<GeneralArrayType> {
+fn general_array_type(s: &str) -> IResult<'_, GeneralArrayType<'_>> {
     map(tuple((
         kw("array"),
         bound_spec,
@@ -1104,7 +1115,7 @@ fn general_array_type(s: &str) -> IResult<GeneralArrayType> {
 #[derive(Debug)]
 pub struct GeneralBagType<'a>(pub Option<BoundSpec<'a>>,
                               pub Box<ParameterType<'a>>);
-fn general_bag_type(s: &str) -> IResult<GeneralBagType> {
+fn general_bag_type(s: &str) -> IResult<'_, GeneralBagType<'_>> {
     map(tuple((
             kw("bag"),
             opt(bound_spec),
@@ -1121,7 +1132,7 @@ pub struct GeneralListType<'a> {
     pub unique: bool,
     pub parameter_type: Box<ParameterType<'a>>,
 }
-fn general_list_type(s: &str) -> IResult<GeneralListType> {
+fn general_list_type(s: &str) -> IResult<'_, GeneralListType<'_>> {
     map(tuple((
         kw("list"),
         opt(bound_spec),
@@ -1143,7 +1154,7 @@ pub enum GeneralRef<'a> {
     Variable(VariableRef<'a>),
     _SimpleId(SimpleId<'a>),
 }
-fn general_ref(s: &str) -> IResult<GeneralRef> {
+fn general_ref(s: &str) -> IResult<'_, GeneralRef<'_>> {
     map(simple_id, GeneralRef::_SimpleId)(s)
 }
 
@@ -1153,7 +1164,7 @@ pub struct GeneralSetType<'a> {
     pub bounds: Option<BoundSpec<'a>>,
     pub parameter_type: Box<ParameterType<'a>>,
 }
-fn general_set_type(s: &str) -> IResult<GeneralSetType> {
+fn general_set_type(s: &str) -> IResult<'_, GeneralSetType<'_>> {
     map(tuple((
         kw("set"),
         opt(bound_spec),
@@ -1169,7 +1180,7 @@ fn general_set_type(s: &str) -> IResult<GeneralSetType> {
 // 230 generic_entity_type = GENERIC_ENTITY [ ’:’ type_label ] .
 #[derive(Debug)]
 pub struct GenericEntityType<'a>(Option<TypeLabel<'a>>);
-fn generic_entity_type(s: &str) -> IResult<GenericEntityType> {
+fn generic_entity_type(s: &str) -> IResult<'_, GenericEntityType<'_>> {
     map(preceded(kw("generic_entity"),
                  opt(preceded(char(':'), type_label))),
         GenericEntityType)(s)
@@ -1178,7 +1189,7 @@ fn generic_entity_type(s: &str) -> IResult<GenericEntityType> {
 // 231 generic_type = GENERIC [ ’:’ type_label ] .
 #[derive(Debug)]
 pub struct GenericType<'a>(Option<TypeLabel<'a>>);
-fn generic_type(s: &str) -> IResult<GenericType> {
+fn generic_type(s: &str) -> IResult<'_, GenericType<'_>> {
     map(preceded(kw("generic"),
                  opt(preceded(char(':'), type_label))),
         GenericType)(s)
@@ -1187,7 +1198,7 @@ fn generic_type(s: &str) -> IResult<GenericType> {
 // 232 group_qualifier = ’\’ entity_ref .
 #[derive(Debug)]
 pub struct GroupQualifier<'a>(pub EntityRef<'a>);
-fn group_qualifier(s: &str) -> IResult<GroupQualifier> {
+fn group_qualifier(s: &str) -> IResult<'_, GroupQualifier<'_>> {
     map(preceded(char('\\'), entity_ref), GroupQualifier)(s)
 }
 
@@ -1195,7 +1206,7 @@ fn group_qualifier(s: &str) -> IResult<GroupQualifier> {
 //               END_IF ’;’ .
 #[derive(Debug)]
 pub struct IfStmt<'a>(LogicalExpression<'a>, Vec<Stmt<'a>>, Option<Vec<Stmt<'a>>>);
-fn if_stmt(s: &str) -> IResult<IfStmt> {
+fn if_stmt(s: &str) -> IResult<'_, IfStmt<'_>> {
     map(tuple((
         kw("if"),
         logical_expression,
@@ -1218,7 +1229,7 @@ pub struct IncrementControl<'a> {
     pub bound2: Bound2<'a>,
     pub increment: Option<Increment<'a>>,
 }
-fn increment_control(s: &str) -> IResult<IncrementControl> {
+fn increment_control(s: &str) -> IResult<'_, IncrementControl<'_>> {
     map(tuple((
         variable_id,
         tag(":="),
@@ -1246,7 +1257,7 @@ alias!(Index2<'a>, Index, index_2);
 // 239 index_qualifier = ’[’ index_1 [ ’:’ index_2 ] ’]’ .
 #[derive(Debug)]
 pub struct IndexQualifier<'a>(Index1<'a>, Option<Index2<'a>>);
-fn index_qualifier(s: &str) -> IResult<IndexQualifier> {
+fn index_qualifier(s: &str) -> IResult<'_, IndexQualifier<'_>> {
     let (s, _) = char('[')(s)?;
     let (s, index1) = index_1(s)?;
     let (s, index2) = opt(preceded(char(';'), index_2))(s)?;
@@ -1260,7 +1271,7 @@ pub enum InstantiableType<'a> {
     Concrete(ConcreteTypes<'a>),
     EntityRef(EntityRef<'a>),
 }
-fn instantiable_type(s: &str) -> IResult<InstantiableType> {
+fn instantiable_type(s: &str) -> IResult<'_, InstantiableType<'_>> {
     use InstantiableType::*;
     alt((
         map(concrete_types, Concrete),
@@ -1269,7 +1280,7 @@ fn instantiable_type(s: &str) -> IResult<InstantiableType> {
 }
 
 // 241 integer_type = INTEGER .
-fn integer_type(s: &str) -> IResult<()> {
+fn integer_type(s: &str) -> IResult<'_, ()> {
     map(kw("integer"), |_| ())(s)
 }
 
@@ -1279,7 +1290,7 @@ pub enum InterfaceSpecification<'a> {
     ReferenceClause(ReferenceClause<'a>),
     UseClause(UseClause<'a>),
 }
-fn interface_specification(s: &str) -> IResult<InterfaceSpecification> {
+fn interface_specification(s: &str) -> IResult<'_, InterfaceSpecification<'_>> {
     use InterfaceSpecification::*;
     alt((map(reference_clause, ReferenceClause),
          map(use_clause, UseClause)))(s)
@@ -1294,7 +1305,7 @@ pub struct Interval<'a> {
     pub op2: IntervalOp,
     pub high: IntervalHigh<'a>,
 }
-fn interval(s: &str) -> IResult<Interval> {
+fn interval(s: &str) -> IResult<'_, Interval<'_>> {
     map(delimited(
         char('{'),
         tuple((
@@ -1321,7 +1332,7 @@ alias!(IntervalLow<'a>, SimpleExpression, interval_low);
 // 247
 #[derive(Debug)]
 pub enum IntervalOp { LessThan, LessThanOrEqual }
-fn interval_op(s: &str) -> IResult<IntervalOp> {
+fn interval_op(s: &str) -> IResult<'_, IntervalOp> {
     alt((
         // Sort by length to pick the best match
         map(tag("<="), |_| IntervalOp::LessThanOrEqual),
@@ -1341,7 +1352,7 @@ pub struct InverseAttr<'a> {
     pub entity_for: Option<EntityRef<'a>>,
     pub attribute_ref: AttributeRef<'a>,
 }
-fn inverse_attr(s: &str) -> IResult<InverseAttr> {
+fn inverse_attr(s: &str) -> IResult<'_, InverseAttr<'_>> {
     map(tuple((
         attribute_decl,
         char(':'),
@@ -1368,7 +1379,7 @@ fn inverse_attr(s: &str) -> IResult<InverseAttr> {
 // 249 inverse_clause = INVERSE inverse_attr { inverse_attr } .
 #[derive(Debug)]
 pub struct InverseClause<'a>(Vec<InverseAttr<'a>>);
-fn inverse_clause(s: &str) -> IResult<InverseClause> {
+fn inverse_clause(s: &str) -> IResult<'_, InverseClause<'_>> {
     map(preceded(kw("inverse"), many1(inverse_attr)), InverseClause)(s)
 }
 
@@ -1379,7 +1390,7 @@ pub struct ListType<'a> {
     pub unique: bool,
     pub instantiable_type: Box<InstantiableType<'a>>,
 }
-fn list_type(s: &str) -> IResult<ListType> {
+fn list_type(s: &str) -> IResult<'_, ListType<'_>> {
     map(tuple((
         kw("list"),
         opt(bound_spec),
@@ -1402,7 +1413,7 @@ pub enum Literal {
     Logical(LogicalLiteral),
     Real(f64),
 }
-fn literal(s: &str) -> IResult<Literal> {
+fn literal(s: &str) -> IResult<'_, Literal> {
     use Literal::*;
     alt((
         map(binary_literal, Binary),
@@ -1414,7 +1425,7 @@ fn literal(s: &str) -> IResult<Literal> {
 // 252 local_decl = LOCAL local_variable { local_variable } END_LOCAL ’;’
 #[derive(Debug)]
 pub struct LocalDecl<'a>(Vec<LocalVariable<'a>>);
-fn local_decl(s: &str) -> IResult<LocalDecl> {
+fn local_decl(s: &str) -> IResult<'_, LocalDecl<'_>> {
     map(tuple((
         kw("local"),
         many1(local_variable),
@@ -1430,7 +1441,7 @@ pub struct LocalVariable<'a> {
     pub parameter_type: ParameterType<'a>,
     pub expression: Option<Expression<'a>>,
 }
-fn local_variable(s: &str) -> IResult<LocalVariable> {
+fn local_variable(s: &str) -> IResult<'_, LocalVariable<'_>> {
     map(tuple((
         list1(',', variable_id),
         char(':'),
@@ -1452,21 +1463,21 @@ alias!(LogicalExpression<'a>, Expression, logical_expression);
 pub enum LogicalLiteral {
     True, False, Unknown
 }
-fn logical_literal(s: &str) -> IResult<LogicalLiteral> {
+fn logical_literal(s: &str) -> IResult<'_, LogicalLiteral> {
     alt((map(kw("false"),   |_| LogicalLiteral::False),
          map(kw("true"),    |_| LogicalLiteral::True),
          map(kw("unknown"), |_| LogicalLiteral::Unknown)))(s)
 }
 
 // 256 logical_type = LOGICAL .
-fn logical_type(s: &str) -> IResult<()> {
+fn logical_type(s: &str) -> IResult<'_, ()> {
     map(kw("logical"), |_| ())(s)
 }
 
 // 257
 #[derive(Debug)]
 pub enum MultiplicationLikeOp {Mul, Div, IntegerDiv, Mod, And, ComplexEntity }
-fn multiplication_like_op(s: &str) -> IResult<MultiplicationLikeOp> {
+fn multiplication_like_op(s: &str) -> IResult<'_, MultiplicationLikeOp> {
     use MultiplicationLikeOp::*;
     alt((
         map(char('*'),  |_| Mul),
@@ -1485,7 +1496,7 @@ pub enum NamedTypes<'a> {
     Type(TypeRef<'a>),
     _Ambiguous(SimpleId<'a>),
 }
-fn named_types(s: &str) -> IResult<NamedTypes> {
+fn named_types(s: &str) -> IResult<'_, NamedTypes<'_>> {
     map(simple_id, NamedTypes::_Ambiguous)(s)
 }
 
@@ -1501,7 +1512,7 @@ pub struct NamedTypeOrRename<'a> {
     pub named_types: NamedTypes<'a>,
     pub rename: Option<EntityOrTypeId<'a>>,
 }
-fn named_type_or_rename(s: &str) -> IResult<NamedTypeOrRename> {
+fn named_type_or_rename(s: &str) -> IResult<'_, NamedTypeOrRename<'_>> {
     map(pair(
         named_types,
         opt(preceded(kw("as"),
@@ -1510,12 +1521,12 @@ fn named_type_or_rename(s: &str) -> IResult<NamedTypeOrRename> {
 }
 
 // 260 null_stmt = ’;’ .
-fn null_stmt(s: &str) -> IResult<()> {
+fn null_stmt(s: &str) -> IResult<'_, ()> {
     map(char(';'), |_| ())(s)
 }
 
 // 261 number_type = NUMBER .
-fn number_type(s: &str) -> IResult<()> {
+fn number_type(s: &str) -> IResult<'_, ()> {
     map(kw("number"), |_| ())(s)
 }
 
@@ -1525,7 +1536,7 @@ alias!(NumericExpression<'a>, SimpleExpression);
 // 263 one_of = ONEOF ’(’ supertype_expression { ’,’ supertype_expression } ’)’
 #[derive(Debug)]
 pub struct OneOf<'a>(Vec<SupertypeExpression<'a>>);
-fn one_of(s: &str) -> IResult<OneOf> {
+fn one_of(s: &str) -> IResult<'_, OneOf<'_>> {
     map(preceded(
         kw("oneof"),
         parens(list1(',', supertype_expression)),
@@ -1545,7 +1556,7 @@ pub enum ParameterType<'a> {
     Named(NamedTypes<'a>),
     Simple(SimpleTypes<'a>),
 }
-fn parameter_type(s: &str) -> IResult<ParameterType> {
+fn parameter_type(s: &str) -> IResult<'_, ParameterType<'_>> {
     use ParameterType::*;
     alt((
         map(generalized_types, Generalized),
@@ -1567,7 +1578,7 @@ pub enum Primary<'a> {
     Literal(Literal),
     Qualifiable(QualifiableFactor<'a>, Vec<Qualifier<'a>>),
 }
-fn primary(s: &str) -> IResult<Primary> {
+fn primary(s: &str) -> IResult<'_, Primary<'_>> {
     use Primary::*;
     alt((
         // Order so that the longest parser runs first
@@ -1589,7 +1600,7 @@ pub struct ProcedureCallStmt<'a> {
     pub proc: BuiltInOrProcedureRef<'a>,
     pub params: Option<ActualParameterList<'a>>,
 }
-fn procedure_call_stmt(s: &str) -> IResult<ProcedureCallStmt> {
+fn procedure_call_stmt(s: &str) -> IResult<'_, ProcedureCallStmt<'_>> {
     map(tuple((
         alt((map(built_in_procedure, BuiltInOrProcedureRef::BuiltIn),
              map(procedure_ref, BuiltInOrProcedureRef::ProcedureRef),
@@ -1604,7 +1615,7 @@ fn procedure_call_stmt(s: &str) -> IResult<ProcedureCallStmt> {
 // 271 procedure_decl = procedure_head algorithm_head { stmt } END_PROCEDURE ’;’ .
 #[derive(Debug)]
 pub struct ProcedureDecl<'a>(ProcedureHead<'a>, AlgorithmHead<'a>, Vec<Stmt<'a>>);
-fn procedure_decl(s: &str) -> IResult<ProcedureDecl> {
+fn procedure_decl(s: &str) -> IResult<'_, ProcedureDecl<'_>> {
     map(tuple((
         procedure_head,
         algorithm_head,
@@ -1621,7 +1632,7 @@ pub struct ProcedureHead<'a> {
     pub procedure_id: ProcedureId<'a>,
     pub args: Option<Vec<(bool, FormalParameter<'a>)>>,
 }
-fn procedure_head(s: &str) -> IResult<ProcedureHead> {
+fn procedure_head(s: &str) -> IResult<'_, ProcedureHead<'_>> {
     map(tuple((
         kw("procedure"),
         procedure_id,
@@ -1655,7 +1666,7 @@ pub enum QualifiableFactor<'a> {
     // catch-all for attribute, constant, general, population
     _Ambiguous(&'a str),
 }
-fn qualifiable_factor(s: &str) -> IResult<QualifiableFactor> {
+fn qualifiable_factor(s: &str) -> IResult<'_, QualifiableFactor<'_>> {
     alt((
         // Try parsing the function call first.  One valid parse is just a
         // function_ref, so we convert that case to _Ambiguous, since it may
@@ -1686,7 +1697,7 @@ fn qualifiable_factor(s: &str) -> IResult<QualifiableFactor> {
 #[derive(Debug)]
 pub struct QualifiedAttribute<'a>(pub GroupQualifier<'a>,
                                   pub AttributeQualifier<'a>);
-fn qualified_attribute(s: &str) -> IResult<QualifiedAttribute> {
+fn qualified_attribute(s: &str) -> IResult<'_, QualifiedAttribute<'_>> {
     map(tuple((
         kw("self"),
         group_qualifier,
@@ -1701,7 +1712,7 @@ pub enum Qualifier<'a> {
     Group(GroupQualifier<'a>),
     Index(IndexQualifier<'a>),
 }
-fn qualifier(s: &str) -> IResult<Qualifier> {
+fn qualifier(s: &str) -> IResult<'_, Qualifier<'_>> {
     use Qualifier::*;
     alt((
         map(attribute_qualifier, Attribute),
@@ -1718,7 +1729,7 @@ pub struct QueryExpression<'a> {
     pub aggregate: AggregateSource<'a>,
     pub logical_expression: LogicalExpression<'a>,
 }
-fn query_expression(s: &str) -> IResult<QueryExpression> {
+fn query_expression(s: &str) -> IResult<'_, QueryExpression<'_>> {
     map(tuple((
         kw("query"),
         char('('),
@@ -1738,7 +1749,7 @@ fn query_expression(s: &str) -> IResult<QueryExpression> {
 // 278 real_type = REAL [ ’(’ precision_spec ’)’ ] .
 #[derive(Debug)]
 pub struct RealType<'a>(Option<PrecisionSpec<'a>>);
-fn real_type(s: &str) -> IResult<RealType> {
+fn real_type(s: &str) -> IResult<'_, RealType<'_>> {
     map(preceded(kw("real"),
                  opt(parens(precision_spec))),
         RealType)(s)
@@ -1748,7 +1759,7 @@ fn real_type(s: &str) -> IResult<RealType> {
 #[derive(Debug)]
 pub struct RedeclaredAttribute<'a>(pub QualifiedAttribute<'a>,
                                    pub Option<AttributeId<'a>>);
-fn redeclared_attribute(s: &str) -> IResult<RedeclaredAttribute> {
+fn redeclared_attribute(s: &str) -> IResult<'_, RedeclaredAttribute<'_>> {
     map(pair(qualified_attribute,
              opt(preceded(kw("renamed"), attribute_id))),
         |(a, b)| RedeclaredAttribute(a, b))(s)
@@ -1760,7 +1771,7 @@ pub enum ReferencedAttribute<'a> {
     Ref(AttributeRef<'a>),
     Qualified(QualifiedAttribute<'a>),
 }
-fn referenced_attribute(s: &str) -> IResult<ReferencedAttribute> {
+fn referenced_attribute(s: &str) -> IResult<'_, ReferencedAttribute<'_>> {
     use ReferencedAttribute::*;
     alt((
         map(attribute_ref, Ref),
@@ -2078,7 +2089,7 @@ fn set_type(s: &str) -> IResult<'_, SetType<'_>> {
 #[derive(Debug)]
 pub struct SimpleExpression<'a>(pub Box<Term<'a>>, pub Vec<(AddLikeOp, Term<'a>)>);
 impl<'a> SimpleExpression<'a> {
-    fn parse(s: &'a str) -> IResult<Self> {
+    fn parse(s: &'a str) -> IResult<'a, Self> {
         let (s, a) = term(s)?;
         let (s, b) = many0(pair(add_like_op, term))(s)?;
         Ok((s, SimpleExpression(Box::new(a), b)))

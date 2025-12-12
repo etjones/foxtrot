@@ -655,7 +655,7 @@ impl<'a> TypeDecl<'a> {
     }
 }
 impl<'a> UnderlyingType<'a> {
-    fn to_type(&'a self, type_map: &mut TypeMap<'a>) -> Type {
+    fn to_type(&'a self, type_map: &mut TypeMap<'a>) -> Type<'a> {
         match self {
             UnderlyingType::Concrete(c) => c.to_type(type_map),
             UnderlyingType::Constructed(c) => c.to_type(),
@@ -663,7 +663,7 @@ impl<'a> UnderlyingType<'a> {
     }
 }
 impl<'a> ConcreteTypes<'a> {
-    fn to_type(&self, type_map: &mut TypeMap<'a>) -> Type {
+    fn to_type(&self, type_map: &mut TypeMap<'a>) -> Type<'_> {
         match self {
             ConcreteTypes::Aggregation(a) => a.to_type(type_map),
             ConcreteTypes::Simple(s) => s.to_type(),
@@ -718,7 +718,7 @@ impl<'a> SimpleExpression<'a> {
     }
 }
 impl<'a> AggregationTypes<'a> {
-    fn to_type(&self, type_map: &mut TypeMap<'a>) -> Type {
+    fn to_type(&self, type_map: &mut TypeMap<'a>) -> Type<'_> {
         let (optional, instantiable) = match self {
             AggregationTypes::Array(a) => (a.optional, &a.instantiable_type),
             AggregationTypes::Bag(a) => (false,  &a.1),
@@ -737,7 +737,7 @@ impl<'a> AggregationTypes<'a> {
     }
 }
 impl<'a> ConstructedTypes<'a> {
-    fn to_type(&'a self) -> Type {
+    fn to_type(&'a self) -> Type<'a> {
         match self {
             ConstructedTypes::Enumeration(e) => e.to_type(),
             ConstructedTypes::Select(s) => s.to_type(),
@@ -745,7 +745,7 @@ impl<'a> ConstructedTypes<'a> {
     }
 }
 impl<'a> EnumerationType<'a> {
-    fn to_type(&self) -> Type {
+    fn to_type(&self) -> Type<'_> {
         assert!(!self.extensible, "Extensible enumerations are not supported");
         match self.items_or_extension.as_ref().unwrap() {
             EnumerationItemsOrExtension::Items(e) => e.to_type(),
@@ -754,7 +754,7 @@ impl<'a> EnumerationType<'a> {
     }
 }
 impl<'a> EnumerationItems<'a> {
-    fn to_type(&self) -> Type {
+    fn to_type(&self) -> Type<'_> {
         let mut out = Vec::new();
         for e in &self.0 {
             out.push(e.0);
@@ -763,7 +763,7 @@ impl<'a> EnumerationItems<'a> {
     }
 }
 impl<'a> SelectType<'a> {
-    fn to_type(&'a self) -> Type {
+    fn to_type(&'a self) -> Type<'a> {
         assert!(!self.extensible, "Cannot handle extensible lists");
         assert!(!self.generic_entity, "Cannot handle generic entity lists");
         match &self.list_or_extension {
@@ -773,7 +773,7 @@ impl<'a> SelectType<'a> {
     }
 }
 impl<'a> SelectList<'a> {
-    fn to_type(&'a self) -> Type {
+    fn to_type(&'a self) -> Type<'a> {
         let mut out = Vec::new();
         for e in &self.0 {
             out.push(e.name());
@@ -950,7 +950,7 @@ impl <'a> SimpleTypes<'a> {
             SimpleTypes::String(_) => "&'a str",
         }
     }
-    fn to_type(&self) -> Type {
+    fn to_type(&self) -> Type<'_> {
         Type::RedeclaredPrimitive(self.to_attr_type_str())
     }
 }

@@ -3,8 +3,164 @@ use std::f64::{EPSILON, consts::PI};
 use nalgebra_glm as glm;
 use glm::{DVec2, DVec3, DVec4, DMat4};
 
-use nurbs::{AbstractSurface, NDBSplineSurface, SampledSurface};
+use nurbs::{AbstractCurve, AbstractSurface, NDBSplineCurve, NDBSplineSurface, SampledSurface};
 use crate::{Error, mesh::Vertex};
+
+#[derive(Debug, Clone)]
+pub enum ExtrusionCurve {
+    BSpline {
+        curve: nurbs::BSplineCurve,
+        samples: Vec<(f64, DVec3)>,
+    },
+    NURBS {
+        curve: nurbs::NURBSCurve,
+        samples: Vec<(f64, DVec3)>,
+    },
+    Line {
+        origin: DVec3,
+        dir_unit: DVec3,
+    },
+}
+
+fn curve_samples<const N: usize>(curve: &NDBSplineCurve<N>) -> Vec<(f64, DVec3)>
+where
+    NDBSplineCurve<N>: AbstractCurve,
+{
+    const NUM_SAMPLES_PER_KNOT: usize = 8;
+    let mut samples = Vec::new();
+    for i in 0..curve.knots.len() - 1 {
+        if curve.knots[i] == curve.knots[i + 1] {
+            continue;
+        }
+        for j in 0..NUM_SAMPLES_PER_KNOT {
+            let frac = (j as f64) / (NUM_SAMPLES_PER_KNOT as f64 - 1.0);
+            let u = curve.knots[i] * (1.0 - frac) + curve.knots[i + 1] * frac;
+            samples.push((u, curve.point(u)));
+        }
+    }
+    samples
+}
+
+fn project_perp(p: DVec3, dir_unit: DVec3) -> DVec3 {
+    p - dir_unit * p.dot(&dir_unit)
+}
+
+fn clamp_open_interval(u: f64, u_min: f64, u_max: f64) -> f64 {
+    if u < u_min {
+        u_min
+    } else if u > u_max {
+        u_max
+    } else {
+        u
+    }
+}
+
+fn curve_min_u<const N: usize>(curve: &NDBSplineCurve<N>) -> f64 {
+    curve.min_u()
+}
+
+fn curve_max_u<const N: usize>(curve: &NDBSplineCurve<N>) -> f64 {
+    curve.max_u()
+}
+
+fn closest_u_initial_guess(samples: &[(f64, DVec3)], p_perp: DVec3, dir_unit: DVec3) -> f64 {
+    let mut best_u = 0.0;
+    let mut best_dist = std::f64::INFINITY;
+    for (u, pos) in samples {
+        let d = (project_perp(*pos, dir_unit) - p_perp).norm();
+        if d < best_dist {
+            best_dist = d;
+            best_u = *u;
+        }
+    }
+    best_u
+}
+
+fn closest_u_newton<const N: usize>(curve: &NDBSplineCurve<N>, p_perp: DVec3, dir_unit: DVec3, u0: f64) -> f64
+where
+    NDBSplineCurve<N>: AbstractCurve,
+{
+    let u_min = curve_min_u(curve);
+    let u_max = curve_max_u(curve);
+    let mut u_i = clamp_open_interval(u0, u_min, u_max);
+
+    // A coarse convergence threshold is fine for visualization
+    let eps1 = 0.01;
+    for _ in 0..64 {
+        let derivs = curve.derivs::<2>(u_i);
+        let c = project_perp(derivs[0], dir_unit);
+        let c_p = project_perp(derivs[1], dir_unit);
+        let c_pp = project_perp(derivs[2], dir_unit);
+        let r = c - p_perp;
+
+        if r.norm() <= eps1 {
+            return u_i;
+        }
+
+        let denom = c_pp.dot(&r) + c_p.norm_squared();
+        if denom.abs() <= std::f64::EPSILON {
+            return u_i;
+        }
+        let delta = -c_p.dot(&r) / denom;
+        let u_next = clamp_open_interval(u_i + delta, u_min, u_max);
+
+        if ((u_next - u_i) * c_p.norm()).abs() <= eps1 {
+            return u_next;
+        }
+        u_i = u_next;
+    }
+    u_i
+}
+
+impl ExtrusionCurve {
+    pub fn new_bspline(curve: nurbs::BSplineCurve) -> Self {
+        let samples = curve_samples(&curve);
+        Self::BSpline { curve, samples }
+    }
+
+    pub fn new_nurbs(curve: nurbs::NURBSCurve) -> Self {
+        let samples = curve_samples(&curve);
+        Self::NURBS { curve, samples }
+    }
+
+    pub fn new_line(origin: DVec3, dir_unit: DVec3) -> Self {
+        Self::Line { origin, dir_unit }
+    }
+
+    pub fn point(&self, u: f64) -> DVec3 {
+        match self {
+            Self::BSpline { curve, .. } => curve.point(u),
+            Self::NURBS { curve, .. } => curve.point(u),
+            Self::Line { origin, dir_unit } => *origin + *dir_unit * u,
+        }
+    }
+
+    pub fn deriv1(&self, u: f64) -> DVec3 {
+        match self {
+            Self::BSpline { curve, .. } => curve.derivs::<1>(u)[1],
+            Self::NURBS { curve, .. } => curve.derivs::<1>(u)[1],
+            Self::Line { dir_unit, .. } => *dir_unit,
+        }
+    }
+
+    pub fn closest_u_perp(&self, p: DVec3, dir_unit: DVec3) -> f64 {
+        let p_perp = project_perp(p, dir_unit);
+        match self {
+            Self::BSpline { curve, samples } => {
+                let u0 = closest_u_initial_guess(samples, p_perp, dir_unit);
+                closest_u_newton(curve, p_perp, dir_unit, u0)
+            }
+            Self::NURBS { curve, samples } => {
+                let u0 = closest_u_initial_guess(samples, p_perp, dir_unit);
+                closest_u_newton(curve, p_perp, dir_unit, u0)
+            }
+            Self::Line { origin, dir_unit: line_dir } => {
+                // Choose u as signed distance along the line direction.
+                (p - *origin).dot(line_dir)
+            }
+        }
+    }
+}
 
 // Represents a surface in 3D space, with a function to project a 3D point
 // on the surface down to a 2D space.
@@ -44,6 +200,10 @@ pub enum Surface {
         major_radius: f64,
         minor_radius: f64,
     },
+    LinearExtrusion {
+        curve: ExtrusionCurve,
+        dir_unit: DVec3,
+    },
 }
 
 impl Surface {
@@ -54,6 +214,11 @@ impl Surface {
             mat_i: DMat4::identity(),
             location, radius,
         }
+
+    }
+
+    pub fn new_linear_extrusion(curve: ExtrusionCurve, dir_unit: DVec3) -> Self {
+        Surface::LinearExtrusion { curve, dir_unit }
     }
     pub fn new_cylinder(axis: DVec3, ref_direction: DVec3, location: DVec3, radius: f64) -> Self {
         let mat = Self::make_rigid_transform(axis, ref_direction, location);
@@ -202,6 +367,12 @@ impl Surface {
                 } else {
                     yz * angle / yz.norm()
                 })
+            },
+            Surface::LinearExtrusion { curve, dir_unit } => {
+                let u = curve.closest_u_perp(p, *dir_unit);
+                let c = curve.point(u);
+                let v = (p - c).dot(dir_unit);
+                Ok(DVec2::new(u, v))
             },
         }
     }
@@ -409,6 +580,16 @@ impl Surface {
                 let norm = (p - z).normalize();
 
                 (mat * norm.to_homogeneous()).xyz()
+            },
+            Surface::LinearExtrusion { curve, dir_unit } => {
+                let du = curve.deriv1(uv.x);
+                let n = du.cross(dir_unit);
+                if n.norm() <= std::f64::EPSILON {
+                    // Degenerate tangent; fall back to something stable-ish
+                    (p - (p.dot(dir_unit) * *dir_unit)).normalize()
+                } else {
+                    n.normalize()
+                }
             },
         }
     }

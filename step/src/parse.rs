@@ -41,7 +41,7 @@ pub(crate) trait Parse<'a> {
 }
 
 impl Parse<'_> for f64 {
-    fn parse(s: &str) -> IResult<Self> {
+    fn parse(s: &str) -> IResult<'_, Self> {
         match fast_float::parse_partial::<f64, _>(s) {
             Err(_) => nom_err(s, ErrorKind::Float),
             Ok((x, n)) => Ok((&s[n..], x)),
@@ -50,7 +50,7 @@ impl Parse<'_> for f64 {
 }
 
 impl Parse<'_> for i64 {
-    fn parse(s: &str) -> IResult<Self> {
+    fn parse(s: &str) -> IResult<'_, Self> {
         map_res(tuple((opt(char('-')), digit1)),
             |(sign, digits)| -> Result<i64, <i64 as std::str::FromStr>::Err> {
                 let num = str::parse::<i64>(digits)?;
@@ -131,7 +131,7 @@ impl<'a> Parse<'a> for bool {
     }
 }
 impl<'a, T> Parse<'a> for Id<T> {
-    fn parse(s: &str) -> IResult<Self> {
+    fn parse(s: &str) -> IResult<'_, Self> {
         alt((
             map_res(
                 preceded(char('#'), digit1),
@@ -158,7 +158,7 @@ impl<'a, T: ParseFromChunks<'a>> Parse<'a> for T {
 // optionally followed by a comma
 pub struct Derived;
 impl<'a> Parse<'a> for Derived {
-    fn parse(s: &str) -> IResult<Self> {
+    fn parse(s: &str) -> IResult<'_, Self> {
         map(char('*'), |_| Derived)(s)
     }
 }
@@ -190,7 +190,7 @@ pub(crate) fn param_from_chunks<'a, T: Parse<'a>>(
     Ok((check_str(s, i, strs), out))
 }
 
-pub(crate) fn parse_enum_tag(s: &str) -> IResult<&str> {
+pub(crate) fn parse_enum_tag(s: &str) -> IResult<'_, &str> {
     delimited(char('.'),
               nom::bytes::complete::take_while(
                   |c: char| c == '_' ||
@@ -201,7 +201,7 @@ pub(crate) fn parse_enum_tag(s: &str) -> IResult<&str> {
 
 ////////////////////////////////////////////////////////////////////////////////
 
-pub(crate) fn parse_entity_decl(s: &[u8]) -> IResult<(usize, Entity)> {
+pub(crate) fn parse_entity_decl<'a>(s: &'a [u8]) -> IResult<'a, (usize, Entity<'a>)> {
     let s = match std::str::from_utf8(s) {
         Ok(s) => s,
         Err(_) => return nom_err("", ErrorKind::Escaped), // TODO correct code?
@@ -210,7 +210,7 @@ pub(crate) fn parse_entity_decl(s: &[u8]) -> IResult<(usize, Entity)> {
         |(i, _, e)| (i.0, e))(s)
 }
 
-pub(crate) fn parse_entity_fallback(s: &[u8]) -> IResult<(usize, Entity)> {
+pub(crate) fn parse_entity_fallback<'a>(s: &'a [u8]) -> IResult<'a, (usize, Entity<'a>)> {
     let s = match std::str::from_utf8(s) {
         Ok(s) => s,
         Err(_) => return nom_err("", ErrorKind::Escaped),
@@ -218,14 +218,14 @@ pub(crate) fn parse_entity_fallback(s: &[u8]) -> IResult<(usize, Entity)> {
     map(Id::<()>::parse, |i| (i.0, Entity::_FailedToParse))(s)
 }
 
-pub(crate) fn parse_complex_mapping(s: &str) -> IResult<Entity> {
+pub(crate) fn parse_complex_mapping<'a>(s: &'a str) -> IResult<'a, Entity<'a>> {
     // We'll maintain a map from sub-entity name to its argument string, then
     // use this map to figure out the tree and construct it.
-    let mut subentities: HashMap<&str, &str> = HashMap::new();
+    let mut subentities: HashMap<&'a str, &'a str> = HashMap::new();
 
     // Map from sub-entity name to the str slice which contains the name plus
     // the open parens, used for parsing slices
-    let mut name_tags: HashMap<&str, &str> = HashMap::new();
+    let mut name_tags: HashMap<&'a str, &'a str> = HashMap::new();
     let bstr = s.as_bytes();
     let mut depth = 0;
     let mut index = 0;

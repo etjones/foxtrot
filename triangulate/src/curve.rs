@@ -1,8 +1,8 @@
+use glm::{DMat4, DVec3, DVec4};
 use nalgebra_glm as glm;
-use glm::{DVec3, DVec4, DMat4};
 
-use nurbs::{AbstractCurve, NDBSplineCurve, SampledCurve};
 use crate::surface::Surface;
+use nurbs::{AbstractCurve, NDBSplineCurve, SampledCurve};
 
 #[derive(Debug)]
 pub enum Curve {
@@ -11,7 +11,7 @@ pub enum Curve {
         eplane_from_world: DMat4,
         world_from_eplane: DMat4,
         closed: bool,
-        dir: bool
+        dir: bool,
     },
     Line,
     BSplineCurveWithKnots(SampledCurve<3>),
@@ -19,29 +19,40 @@ pub enum Curve {
 }
 
 impl Curve {
-    pub fn new_ellipse(location: DVec3, axis: DVec3, ref_direction: DVec3,
-                       radius1: f64, radius2: f64, closed: bool, dir: bool)
-        -> Self
-    {
+    pub fn new_ellipse(
+        location: DVec3,
+        axis: DVec3,
+        ref_direction: DVec3,
+        radius1: f64,
+        radius2: f64,
+        closed: bool,
+        dir: bool,
+    ) -> Self {
         // Build a rotation matrix to go from flat (XY) to 3D space
-        let world_from_eplane = Surface::make_affine_transform(axis,
+        let world_from_eplane = Surface::make_affine_transform(
+            axis,
             radius1 * ref_direction,
             radius2 * axis.cross(&ref_direction),
-            location);
-        let eplane_from_world = world_from_eplane
-            .try_inverse()
-            .expect("Could not invert");
+            location,
+        );
+        let eplane_from_world = world_from_eplane.try_inverse().expect("Could not invert");
         Self::Ellipse {
             world_from_eplane,
             eplane_from_world,
-            closed, dir
+            closed,
+            dir,
         }
     }
 
-    pub fn new_circle(location: DVec3, axis: DVec3, ref_direction: DVec3,
-                      radius: f64, closed: bool, dir: bool) -> Self {
-        Self::new_ellipse(location, axis, ref_direction,
-                          radius, radius, closed, dir)
+    pub fn new_circle(
+        location: DVec3,
+        axis: DVec3,
+        ref_direction: DVec3,
+        radius: f64,
+        closed: bool,
+        dir: bool,
+    ) -> Self {
+        Self::new_ellipse(location, axis, ref_direction, radius, radius, closed, dir)
     }
 
     pub fn new_line() -> Self {
@@ -49,7 +60,8 @@ impl Curve {
     }
 
     fn curve_points<const N: usize>(u: DVec3, v: DVec3, curve: &SampledCurve<N>) -> Vec<DVec3>
-        where NDBSplineCurve<N>: AbstractCurve
+    where
+        NDBSplineCurve<N>: AbstractCurve,
     {
         let t_start = curve.u_from_point(u);
         let t_end = curve.u_from_point(v);
@@ -65,14 +77,15 @@ impl Curve {
             Self::BSplineCurveWithKnots(curve) => Self::curve_points(u, v, curve),
             Self::NURBSCurve(curve) => Self::curve_points(u, v, curve),
             Self::Ellipse {
-                eplane_from_world, world_from_eplane, closed, dir
+                eplane_from_world,
+                world_from_eplane,
+                closed,
+                dir,
             } => {
                 // Project from 3D into the "ellipse plane".  In the "eplane",
                 // the ellipse lies on the unit circle.
-                let u_eplane = eplane_from_world *
-                               DVec4::new(u.x, u.y, u.z, 1.0);
-                let v_eplane = eplane_from_world *
-                               DVec4::new(v.x, v.y, v.z, 1.0);
+                let u_eplane = eplane_from_world * DVec4::new(u.x, u.y, u.z, 1.0);
+                let v_eplane = eplane_from_world * DVec4::new(v.x, v.y, v.z, 1.0);
 
                 // Pick the starting angle in the circle's flat plane
                 let u_ang = u_eplane.y.atan2(u_eplane.x);
@@ -92,8 +105,9 @@ impl Curve {
 
                 const N: usize = 64;
                 let count = 4.max(
-                    (N as f64 * (u_ang - v_ang).abs() /
-                    (2.0 * std::f64::consts::PI)).round() as usize);
+                    (N as f64 * (u_ang - v_ang).abs() / (2.0 * std::f64::consts::PI)).round()
+                        as usize,
+                );
 
                 let mut out_world = vec![u];
                 // Walk around the circle, using the true positions for start

@@ -1,10 +1,10 @@
-use std::f64::{EPSILON, consts::PI};
+use std::f64::{consts::PI, EPSILON};
 
+use glm::{DMat4, DVec2, DVec3, DVec4};
 use nalgebra_glm as glm;
-use glm::{DVec2, DVec3, DVec4, DMat4};
 
+use crate::{mesh::Vertex, Error};
 use nurbs::{AbstractCurve, AbstractSurface, NDBSplineCurve, NDBSplineSurface, SampledSurface};
-use crate::{Error, mesh::Vertex};
 
 #[derive(Debug, Clone)]
 pub enum ExtrusionCurve {
@@ -22,11 +22,44 @@ pub enum ExtrusionCurve {
     },
 }
 
+fn unwrap_theta_in_place(pts: &mut [(f64, f64)]) {
+    if pts.len() < 2 {
+        return;
+    }
+    let two_pi = 2.0 * PI;
+    let mut prev = pts[0].0;
+    for p in &mut pts[1..] {
+        let mut t = p.0;
+        while t - prev > PI {
+            t -= two_pi;
+        }
+        while t - prev < -PI {
+            t += two_pi;
+        }
+        p.0 = t;
+        prev = t;
+    }
+}
+
+fn closest_u_initial_guess_3d(samples: &[(f64, DVec3)], p: DVec3) -> f64 {
+    let mut best_u = 0.0;
+    let mut best_dist = std::f64::INFINITY;
+    for (u, pos) in samples {
+        let d = (*pos - p).norm();
+        if d < best_dist {
+            best_dist = d;
+            best_u = *u;
+        }
+    }
+    best_u
+}
+
 fn curve_samples<const N: usize>(curve: &NDBSplineCurve<N>) -> Vec<(f64, DVec3)>
 where
     NDBSplineCurve<N>: AbstractCurve,
 {
-    const NUM_SAMPLES_PER_KNOT: usize = 8;
+    // const NUM_SAMPLES_PER_KNOT: usize = 8;
+    const NUM_SAMPLES_PER_KNOT: usize = 3;
     let mut samples = Vec::new();
     for i in 0..curve.knots.len() - 1 {
         if curve.knots[i] == curve.knots[i + 1] {
@@ -76,7 +109,12 @@ fn closest_u_initial_guess(samples: &[(f64, DVec3)], p_perp: DVec3, dir_unit: DV
     best_u
 }
 
-fn closest_u_newton<const N: usize>(curve: &NDBSplineCurve<N>, p_perp: DVec3, dir_unit: DVec3, u0: f64) -> f64
+fn closest_u_newton<const N: usize>(
+    curve: &NDBSplineCurve<N>,
+    p_perp: DVec3,
+    dir_unit: DVec3,
+    u0: f64,
+) -> f64
 where
     NDBSplineCurve<N>: AbstractCurve,
 {
@@ -104,6 +142,41 @@ where
         let delta = -c_p.dot(&r) / denom;
         let u_next = clamp_open_interval(u_i + delta, u_min, u_max);
 
+        if ((u_next - u_i) * c_p.norm()).abs() <= eps1 {
+            return u_next;
+        }
+        u_i = u_next;
+    }
+    u_i
+}
+
+fn closest_u_newton_3d<const N: usize>(curve: &NDBSplineCurve<N>, p: DVec3, u0: f64) -> f64
+where
+    NDBSplineCurve<N>: AbstractCurve,
+{
+    let u_min = curve_min_u(curve);
+    let u_max = curve_max_u(curve);
+    let mut u_i = clamp_open_interval(u0, u_min, u_max);
+
+    let eps1 = 0.01;
+    for _ in 0..64 {
+        let derivs = curve.derivs::<2>(u_i);
+        let c = derivs[0];
+        let c_p = derivs[1];
+        let c_pp = derivs[2];
+        let r = c - p;
+
+        if r.norm() <= eps1 {
+            return u_i;
+        }
+
+        let denom = c_pp.dot(&r) + c_p.norm_squared();
+        if denom.abs() <= std::f64::EPSILON {
+            return u_i;
+        }
+
+        let delta = -c_p.dot(&r) / denom;
+        let u_next = clamp_open_interval(u_i + delta, u_min, u_max);
         if ((u_next - u_i) * c_p.norm()).abs() <= eps1 {
             return u_next;
         }
@@ -154,10 +227,27 @@ impl ExtrusionCurve {
                 let u0 = closest_u_initial_guess(samples, p_perp, dir_unit);
                 closest_u_newton(curve, p_perp, dir_unit, u0)
             }
-            Self::Line { origin, dir_unit: line_dir } => {
+            Self::Line {
+                origin,
+                dir_unit: line_dir,
+            } => {
                 // Choose u as signed distance along the line direction.
                 (p - *origin).dot(line_dir)
             }
+        }
+    }
+
+    pub fn closest_u(&self, p: DVec3) -> f64 {
+        match self {
+            Self::BSpline { curve, samples } => {
+                let u0 = closest_u_initial_guess_3d(samples, p);
+                closest_u_newton_3d(curve, p, u0)
+            }
+            Self::NURBS { curve, samples } => {
+                let u0 = closest_u_initial_guess_3d(samples, p);
+                closest_u_newton_3d(curve, p, u0)
+            }
+            Self::Line { origin, dir_unit } => (p - *origin).dot(dir_unit),
         }
     }
 }
@@ -188,8 +278,8 @@ pub enum Surface {
     NURBS(SampledSurface<4>),
     Sphere {
         location: DVec3,
-        mat: DMat4,     // uv to world
-        mat_i: DMat4,   // world to uv
+        mat: DMat4,   // uv to world
+        mat_i: DMat4, // world to uv
         radius: f64,
     },
     Torus {
@@ -204,6 +294,13 @@ pub enum Surface {
         curve: ExtrusionCurve,
         dir_unit: DVec3,
     },
+    Revolution {
+        curve: ExtrusionCurve,
+        axis_origin: DVec3,
+        axis_unit: DVec3,
+        x_ref: DVec3,
+        y_ref: DVec3,
+    },
 }
 
 impl Surface {
@@ -212,33 +309,46 @@ impl Surface {
             // mat and mat_i are built in prepare()
             mat: DMat4::identity(),
             mat_i: DMat4::identity(),
-            location, radius,
+            location,
+            radius,
         }
-
     }
 
     pub fn new_linear_extrusion(curve: ExtrusionCurve, dir_unit: DVec3) -> Self {
         Surface::LinearExtrusion { curve, dir_unit }
+    }
+
+    pub fn new_revolution(curve: ExtrusionCurve, axis_origin: DVec3, axis_unit: DVec3) -> Self {
+        Surface::Revolution {
+            curve,
+            axis_origin,
+            axis_unit,
+            x_ref: DVec3::new(1.0, 0.0, 0.0),
+            y_ref: DVec3::new(0.0, 1.0, 0.0),
+        }
     }
     pub fn new_cylinder(axis: DVec3, ref_direction: DVec3, location: DVec3, radius: f64) -> Self {
         let mat = Self::make_rigid_transform(axis, ref_direction, location);
         Surface::Cylinder {
             mat,
             mat_i: mat.try_inverse().expect("Could not invert"),
-            axis, radius, location,
+            axis,
+            radius,
+            location,
             z_min: 0.0,
             z_max: 0.0,
         }
     }
 
-    pub fn new_torus(location: DVec3, axis: DVec3,
-                     major_radius: f64, minor_radius: f64) -> Self
-    {
+    pub fn new_torus(location: DVec3, axis: DVec3, major_radius: f64, minor_radius: f64) -> Self {
         Surface::Torus {
             // mat and mat_i are built in prepare()
             mat: DMat4::identity(),
             mat_i: DMat4::identity(),
-            location, axis, major_radius, minor_radius
+            location,
+            axis,
+            major_radius,
+            minor_radius,
         }
     }
 
@@ -260,13 +370,18 @@ impl Surface {
         }
     }
 
-    pub fn make_affine_transform(z_world: DVec3, x_world: DVec3, y_world: DVec3, origin_world: DVec3) -> DMat4 {
+    pub fn make_affine_transform(
+        z_world: DVec3,
+        x_world: DVec3,
+        y_world: DVec3,
+        origin_world: DVec3,
+    ) -> DMat4 {
         let mut mat = DMat4::identity();
         mat.set_column(0, &glm::vec3_to_vec4(&x_world));
         mat.set_column(1, &glm::vec3_to_vec4(&y_world));
         mat.set_column(2, &glm::vec3_to_vec4(&z_world));
         mat.set_column(3, &glm::vec3_to_vec4(&origin_world));
-        *mat.get_mut((3, 3)).unwrap() =  1.0;
+        *mat.get_mut((3, 3)).unwrap() = 1.0;
         mat
     }
 
@@ -276,12 +391,13 @@ impl Surface {
         mat.set_column(1, &glm::vec3_to_vec4(&z_world.cross(&x_world)));
         mat.set_column(2, &glm::vec3_to_vec4(&z_world));
         mat.set_column(3, &glm::vec3_to_vec4(&origin_world));
-        *mat.get_mut((3, 3)).unwrap() =  1.0;
+        *mat.get_mut((3, 3)).unwrap() = 1.0;
         mat
     }
 
     fn surf_lower<const N: usize>(p: DVec3, surf: &SampledSurface<N>) -> Result<DVec2, Error>
-        where NDBSplineSurface<N>: AbstractSurface
+    where
+        NDBSplineSurface<N>: AbstractSurface,
     {
         surf.uv_from_point(p).ok_or(Error::CouldNotLower)
     }
@@ -292,15 +408,18 @@ impl Surface {
     fn lower(&self, p: DVec3) -> Result<DVec2, Error> {
         let p_ = DVec4::new(p.x, p.y, p.z, 1.0);
         match self {
-            Surface::Plane { mat_i, .. } => {
-                Ok(glm::vec4_to_vec2(&(mat_i * p_)))
-            },
+            Surface::Plane { mat_i, .. } => Ok(glm::vec4_to_vec2(&(mat_i * p_))),
             Surface::Cone { mat_i, .. } => {
                 let xy = glm::vec4_to_vec2(&(mat_i * p_));
                 Ok(DVec2::new(-xy.x, xy.y))
-            },
+            }
 
-            Surface::Cylinder { mat_i, z_min, z_max, .. } => {
+            Surface::Cylinder {
+                mat_i,
+                z_min,
+                z_max,
+                ..
+            } => {
                 let p = mat_i * p_;
                 // We convert the Z coordinates to either add or subtract from
                 // the radius, so that we maintain the right topology (instead
@@ -311,8 +430,13 @@ impl Surface {
                 let z = (p.z - z_min) / (z_max - z_min);
                 let scale = 1.0 / (1.0 + z);
                 Ok(DVec2::new(p.x * scale, p.y * scale))
-            },
-            Surface::Torus { mat_i, major_radius, minor_radius, .. } => {
+            }
+            Surface::Torus {
+                mat_i,
+                major_radius,
+                minor_radius,
+                ..
+            } => {
                 let p = mat_i * p_;
                 /*
                          ^ Y
@@ -332,18 +456,16 @@ impl Surface {
                 // Rotate the point so that it's got Y = 0, so we can calculate
                 // the minor angle
                 let z = DVec3::new(0.0, major_angle.sin(), major_angle.cos());
-                let new_mat = Self::make_rigid_transform(
-                    z, DVec3::new(1.0, 0.0, 0.0), z * *major_radius);
-                let new_mat_i = new_mat.try_inverse()
-                    .expect("Could not invert");
+                let new_mat =
+                    Self::make_rigid_transform(z, DVec3::new(1.0, 0.0, 0.0), z * *major_radius);
+                let new_mat_i = new_mat.try_inverse().expect("Could not invert");
                 let new_p = new_mat_i * DVec4::new(p.x, p.y, p.z, 1.0);
 
                 let minor_angle = new_p.x.atan2(new_p.z);
 
                 // Construct nested circles with a scale based on the ratio
                 // of radiuses (to make an _attempt_ to match 3D distance)
-                let scale = 1.0 + (major_radius / minor_radius) *
-                                  (major_angle + PI) / (2.0 * PI);
+                let scale = 1.0 + (major_radius / minor_radius) * (major_angle + PI) / (2.0 * PI);
 
                 let x = if *major_radius > 0.0 {
                     -minor_angle.cos()
@@ -351,7 +473,7 @@ impl Surface {
                     minor_angle.cos()
                 };
                 Ok(scale * DVec2::new(x, minor_angle.sin()))
-            },
+            }
             Surface::BSpline(surf) => Self::surf_lower(p, surf),
             Surface::NURBS(surf) => Self::surf_lower(p, surf),
             Surface::Sphere { mat_i, radius, .. } => {
@@ -367,19 +489,65 @@ impl Surface {
                 } else {
                     yz * angle / yz.norm()
                 })
-            },
+            }
             Surface::LinearExtrusion { curve, dir_unit } => {
                 let u = curve.closest_u_perp(p, *dir_unit);
                 let c = curve.point(u);
                 let v = (p - c).dot(dir_unit);
                 Ok(DVec2::new(u, v))
-            },
+            }
+            Surface::Revolution {
+                curve,
+                axis_origin,
+                axis_unit,
+                x_ref,
+                y_ref,
+            } => {
+                // Compute theta in the plane perpendicular to the axis
+                let delta = p - *axis_origin;
+                let radial = delta - *axis_unit * delta.dot(axis_unit);
+                if radial.norm() <= EPSILON {
+                    return Err(Error::CouldNotLower);
+                }
+                let x = radial.dot(x_ref);
+                let y = radial.dot(y_ref);
+                let theta = y.atan2(x);
+
+                // Unrotate into the swept curve's plane, then solve for u
+                let delta0 = Self::rotate_about_axis(delta, *axis_unit, -theta);
+                let p0 = *axis_origin + delta0;
+                let u = curve.closest_u(p0);
+                Ok(DVec2::new(theta, u))
+            }
         }
+    }
+
+    fn pick_perp_basis(axis_unit: DVec3) -> (DVec3, DVec3) {
+        let helper = if axis_unit.x.abs() < 0.9 {
+            DVec3::new(1.0, 0.0, 0.0)
+        } else {
+            DVec3::new(0.0, 1.0, 0.0)
+        };
+        let x_ref = axis_unit.cross(&helper).normalize();
+        let y_ref = axis_unit.cross(&x_ref).normalize();
+        (x_ref, y_ref)
+    }
+
+    fn rotate_about_axis(v: DVec3, axis_unit: DVec3, angle: f64) -> DVec3 {
+        // Rodrigues' rotation formula
+        let c = angle.cos();
+        let s = angle.sin();
+        v * c + axis_unit.cross(&v) * s + axis_unit * axis_unit.dot(&v) * (1.0 - c)
     }
 
     fn prepare(&mut self, verts: &[Vertex]) {
         match self {
-            Surface::Cylinder { mat_i, z_min, z_max, .. } => {
+            Surface::Cylinder {
+                mat_i,
+                z_min,
+                z_max,
+                ..
+            } => {
                 *z_min = std::f64::INFINITY;
                 *z_max = -std::f64::INFINITY;
                 for v in verts {
@@ -391,37 +559,64 @@ impl Surface {
                         *z_max = p.z;
                     }
                 }
-            },
-            Surface::Sphere { mat, mat_i, location, .. } => {
+            }
+            Surface::Sphere {
+                mat,
+                mat_i,
+                location,
+                ..
+            } => {
                 let ref_direction = (verts[0].pos - *location).normalize();
                 let d1 = (verts.last().unwrap().pos - *location).normalize();
                 let axis = ref_direction.cross(&d1).normalize();
 
-                *mat = Self::make_rigid_transform(
-                        axis, ref_direction, *location);
-                *mat_i = mat
-                    .try_inverse()
-                    .expect("Could not invert");
-            },
-            Surface::Torus { axis, mat, mat_i, location, .. } => {
-                let mean_dir = verts.iter()
+                *mat = Self::make_rigid_transform(axis, ref_direction, *location);
+                *mat_i = mat.try_inverse().expect("Could not invert");
+            }
+            Surface::Torus {
+                axis,
+                mat,
+                mat_i,
+                location,
+                ..
+            } => {
+                let mean_dir = verts
+                    .iter()
                     .map(|v| v.pos - *location)
                     .sum::<DVec3>()
                     .normalize();
                 let mean_perp_dir = (mean_dir - *axis * mean_dir.dot(axis)).normalize();
-                *mat = Self::make_rigid_transform(
-                    mean_perp_dir, *axis, *location);
-                *mat_i = mat
-                    .try_inverse()
-                    .expect("Could not invert");
-            },
+                *mat = Self::make_rigid_transform(mean_perp_dir, *axis, *location);
+                *mat_i = mat.try_inverse().expect("Could not invert");
+            }
+            Surface::Revolution {
+                axis_origin,
+                axis_unit,
+                x_ref,
+                y_ref,
+                ..
+            } => {
+                // Pick a reference direction from the average radial direction
+                let mut mean = DVec3::zeros();
+                for v in verts {
+                    let delta = v.pos - *axis_origin;
+                    let radial = delta - *axis_unit * delta.dot(axis_unit);
+                    mean += radial;
+                }
+                if mean.norm() > EPSILON {
+                    *x_ref = mean.normalize();
+                    *y_ref = axis_unit.cross(x_ref).normalize();
+                } else {
+                    let (x, y) = Self::pick_perp_basis(*axis_unit);
+                    *x_ref = x;
+                    *y_ref = y;
+                }
+            }
             _ => (),
         }
     }
 
-    pub fn lower_verts(&mut self, verts: &mut [Vertex])
-        -> Result<Vec<(f64, f64)>, Error>
-    {
+    pub fn lower_verts(&mut self, verts: &mut [Vertex]) -> Result<Vec<(f64, f64)>, Error> {
         self.prepare(verts);
         let mut pts = Vec::with_capacity(verts.len());
         for v in verts {
@@ -448,6 +643,42 @@ impl Surface {
         Ok(pts)
     }
 
+    pub fn lower_verts_with_contours(
+        &mut self,
+        verts: &mut [Vertex],
+        contour_starts: &[usize],
+    ) -> Result<Vec<(f64, f64)>, Error> {
+        // Default path for non-revolution surfaces
+        if !matches!(self, Surface::Revolution { .. }) {
+            return self.lower_verts(verts);
+        }
+
+        self.prepare(verts);
+        let mut pts = Vec::with_capacity(verts.len());
+        for v in verts.iter_mut() {
+            let proj = self.lower(v.pos)?;
+            v.norm = self.normal(v.pos, proj);
+            pts.push((proj.x, proj.y));
+        }
+
+        // Unwrap theta per contour to avoid seam collapse.
+        let mut starts = contour_starts.to_vec();
+        if starts.first().copied() != Some(0) {
+            starts.insert(0, 0);
+        }
+        starts.retain(|&s| s < pts.len());
+        if starts.is_empty() {
+            starts.push(0);
+        }
+        starts.push(pts.len());
+
+        for w in starts.windows(2) {
+            let (start, end) = (w[0], w[1]);
+            unwrap_theta_in_place(&mut pts[start..end]);
+        }
+        Ok(pts)
+    }
+
     pub fn raise(&self, uv: DVec2) -> Option<DVec3> {
         match self {
             Surface::Sphere { mat, radius, .. } => {
@@ -458,36 +689,53 @@ impl Surface {
                 let x = angle.cos();
 
                 // Calculate pre-transformed position
-                let pos = (*radius) * if uv.norm() < EPSILON {
-                    DVec3::new(x, 0.0, 0.0)
-                } else {
-                    let yz = uv.normalize() * angle.sin();
-                    DVec3::new(x, yz.x, yz.y)
-                };
+                let pos = (*radius)
+                    * if uv.norm() < EPSILON {
+                        DVec3::new(x, 0.0, 0.0)
+                    } else {
+                        let yz = uv.normalize() * angle.sin();
+                        DVec3::new(x, yz.x, yz.y)
+                    };
                 // Transform into world space
-                let pos = (mat * DVec4::new(pos.x, pos.y, pos.z, 1.0))
-                    .xyz();
+                let pos = (mat * DVec4::new(pos.x, pos.y, pos.z, 1.0)).xyz();
                 Some(pos)
-            },
+            }
             Surface::BSpline(s) => Some(s.surf.point(uv)),
             Surface::NURBS(s) => Some(s.surf.point(uv)),
-            Surface::Torus { mat, minor_radius, major_radius, .. } => {
+            Surface::Torus {
+                mat,
+                minor_radius,
+                major_radius,
+                ..
+            } => {
                 let mut uv = uv;
                 if *major_radius > 0.0 {
                     uv.x *= -1.0;
                 }
                 let minor_angle = uv.y.atan2(uv.x);
-                let major_angle = (uv.norm() - 1.0) /
-                                  (major_radius / minor_radius) * 2.0 * PI - PI;
+                let major_angle = (uv.norm() - 1.0) / (major_radius / minor_radius) * 2.0 * PI - PI;
                 let new_p = DVec3::new(minor_angle.sin(), 0.0, minor_angle.cos()) * *minor_radius;
 
                 let z = DVec3::new(0.0, major_angle.sin(), major_angle.cos());
-                let new_mat = Self::make_rigid_transform(
-                    z, DVec3::new(1.0, 0.0, 0.0), z * *major_radius);
+                let new_mat =
+                    Self::make_rigid_transform(z, DVec3::new(1.0, 0.0, 0.0), z * *major_radius);
                 let p = new_mat * DVec4::new(new_p.x, new_p.y, new_p.z, 1.0);
 
                 Some((mat * p).xyz())
-            },
+            }
+            Surface::Revolution {
+                curve,
+                axis_origin,
+                axis_unit,
+                ..
+            } => {
+                let theta = uv.x;
+                let u = uv.y;
+                let c0 = curve.point(u);
+                let delta0 = c0 - *axis_origin;
+                let delta = Self::rotate_about_axis(delta0, *axis_unit, theta);
+                Some(*axis_origin + delta)
+            }
             _ => unimplemented!(),
         }
     }
@@ -504,13 +752,12 @@ impl Surface {
         (xmin, xmax, ymin, ymax)
     }
 
-    pub fn add_steiner_points(&self, pts: &mut Vec<(f64, f64)>,
-                                     verts: &mut Vec<Vertex>)
-    {
+    pub fn add_steiner_points(&self, pts: &mut Vec<(f64, f64)>, verts: &mut Vec<Vertex>) {
         let (xmin, xmax, ymin, ymax) = Self::bbox(&pts);
         let num_pts = match self {
-            Surface::Sphere { .. }   => 6,
+            Surface::Sphere { .. } => 6,
             Surface::Torus { .. } => 32,
+            Surface::Revolution { .. } => 16,
             _ => 0,
         };
 
@@ -535,7 +782,8 @@ impl Surface {
     }
 
     fn surf_normal<const N: usize>(uv: DVec2, surf: &SampledSurface<N>) -> DVec3
-        where NDBSplineSurface<N>: AbstractSurface
+    where
+        NDBSplineSurface<N>: AbstractSurface,
     {
         // Calculate first order derivs, then cross them to get normal
         let derivs = surf.surf.derivs::<1>(uv);
@@ -547,7 +795,9 @@ impl Surface {
     pub fn normal(&self, p: DVec3, uv: DVec2) -> DVec3 {
         match self {
             Surface::Plane { normal, .. } => *normal,
-            Surface::Cone { mat, mat_i, angle, .. } => {
+            Surface::Cone {
+                mat, mat_i, angle, ..
+            } => {
                 // Project into CONE SPACE
                 let pos = mat_i * DVec4::new(p.x, p.y, p.z, 1.0);
                 let xy = if pos.xy().norm() > std::f64::EPSILON {
@@ -555,8 +805,7 @@ impl Surface {
                 } else {
                     return DVec3::zeros();
                 };
-                let normal = DVec4::new(xy.x * angle.cos(),
-                                        xy.y * angle.cos(), -angle.sin(), 0.0);
+                let normal = DVec4::new(xy.x * angle.cos(), xy.y * angle.cos(), -angle.sin(), 0.0);
                 // Deproject back into world space
                 (mat * normal).xyz()
             }
@@ -569,10 +818,15 @@ impl Surface {
                 // (same hack as below)
                 let norm = DVec3::new(proj.x, proj.y, 0.0).normalize();
                 (mat * norm.to_homogeneous()).xyz()
-            },
+            }
             Surface::BSpline(surf) => Self::surf_normal(uv, surf),
             Surface::NURBS(surf) => Self::surf_normal(uv, surf),
-            Surface::Torus { mat, mat_i, major_radius, .. } => {
+            Surface::Torus {
+                mat,
+                mat_i,
+                major_radius,
+                ..
+            } => {
                 let p = (*mat_i * DVec4::new(p.x, p.y, p.z, 1.0)).xyz();
                 let major_angle = p.y.atan2(p.z);
 
@@ -580,7 +834,7 @@ impl Surface {
                 let norm = (p - z).normalize();
 
                 (mat * norm.to_homogeneous()).xyz()
-            },
+            }
             Surface::LinearExtrusion { curve, dir_unit } => {
                 let du = curve.deriv1(uv.x);
                 let n = du.cross(dir_unit);
@@ -590,7 +844,34 @@ impl Surface {
                 } else {
                     n.normalize()
                 }
-            },
+            }
+            Surface::Revolution {
+                curve,
+                axis_origin,
+                axis_unit,
+                ..
+            } => {
+                let theta = uv.x;
+                let u = uv.y;
+
+                // Tangent in u direction is swept tangent rotated by theta
+                let du0 = curve.deriv1(u);
+                let du = Self::rotate_about_axis(du0, *axis_unit, theta);
+
+                // Radial direction from axis to point determines theta tangent
+                let delta = p - *axis_origin;
+                let radial = delta - *axis_unit * delta.dot(axis_unit);
+                if radial.norm() <= EPSILON {
+                    return DVec3::zeros();
+                }
+                let dtheta = axis_unit.cross(&radial);
+                let n = du.cross(&dtheta);
+                if n.norm() <= EPSILON {
+                    DVec3::zeros()
+                } else {
+                    n.normalize()
+                }
+            }
         }
     }
 }

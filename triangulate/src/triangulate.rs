@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 
 use glm::{DMat4, DVec3, DVec4, U32Vec3};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use nalgebra_glm as glm;
 
 #[cfg(feature = "rayon")]
@@ -257,7 +257,36 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
     info!("num_faces: {}", stats.num_faces);
     info!("num_errors: {}", stats.num_errors);
     info!("num_panics: {}", stats.num_panics);
+    log_mesh_vertices_and_triangles(&mesh);
     (mesh, stats)
+}
+
+fn log_mesh_vertices_and_triangles(mesh: &Mesh) {
+    if !log::log_enabled!(log::Level::Info) {
+        return;
+    }
+
+    info!("mesh.verts (index: [x, y, z]):");
+    for (i, v) in mesh.verts.iter().enumerate() {
+        info!(
+            "{:03}: [{:7.2}, {:7.2}, {:7.2}]",
+            i + 1,
+            v.pos.x,
+            v.pos.y,
+            v.pos.z
+        );
+    }
+
+    info!("mesh.triangles (tri_index: [v0, v1, v2]):");
+    for (i, t) in mesh.triangles.iter().enumerate() {
+        info!(
+            "{:03}: [{}, {}, {}]",
+            i + 1,
+            t.verts.x,
+            t.verts.y,
+            t.verts.z
+        );
+    }
 }
 
 fn item_defined_transformation(s: &StepFile, t: Id<ItemDefinedTransformation_>) -> DMat4 {
@@ -339,6 +368,40 @@ fn axis2_placement_3d(s: &StepFile, t: Id<Axis2Placement3d_>) -> (DVec3, DVec3, 
     (location, axis, ref_direction)
 }
 
+fn axis1_placement(s: &StepFile, t: Id<Axis1Placement_>) -> (DVec3, DVec3) {
+    let a = s.entity(t).expect("Could not get Axis1Placement");
+    let location = cartesian_point(s, a.location);
+    let axis = a
+        .axis
+        .map(|d| direction(s, d))
+        .unwrap_or(DVec3::new(0.0, 0.0, 1.0));
+    debug!(
+        "Axis1Placement id={:?} location={:?} axis(raw)={:?}",
+        t, location, axis
+    );
+    (location, axis)
+}
+
+fn debug_print_vec3(prefix: &str, pts: &[DVec3]) {
+    const MAX: usize = 6;
+    let n = pts.len();
+    if n == 0 {
+        debug!("{}: []", prefix);
+        return;
+    }
+    if n <= MAX {
+        debug!("{} (n={}): {:?}", prefix, n, pts);
+        return;
+    }
+    debug!(
+        "{} (n={}): head={:?} tail={:?}",
+        prefix,
+        n,
+        &pts[..3],
+        &pts[n - 3..]
+    );
+}
+
 fn shell(s: &StepFile, c: Shell, mesh: &mut Mesh, stats: &mut Stats) {
     match &s[c] {
         Entity::ClosedShell(_) => closed_shell(s, c.cast(), mesh, stats),
@@ -379,6 +442,14 @@ fn advanced_face(
     // Grab the surface, returning early if it's unimplemented
     let mut surf = get_surface(s, face.face_geometry)?;
 
+    let is_revolution = matches!(surf, Surface::Revolution { .. });
+    if is_revolution {
+        debug!(
+            "Triangulating AdvancedFace={:?} face_geometry={:?} (Revolution)",
+            f, face.face_geometry
+        );
+    }
+
     // This is the starting point at which we insert new vertices
     let offset = mesh.verts.len();
 
@@ -387,6 +458,14 @@ fn advanced_face(
     let mut edges = Vec::new();
     let v_start = mesh.verts.len();
     let mut num_pts = 0;
+    let mut contour_starts: Vec<usize> = Vec::new();
+
+    let mut bbox_min = DVec3::new(std::f64::INFINITY, std::f64::INFINITY, std::f64::INFINITY);
+    let mut bbox_max = DVec3::new(
+        -std::f64::INFINITY,
+        -std::f64::INFINITY,
+        -std::f64::INFINITY,
+    );
     for b in &face.bounds {
         let bound_contours = face_bound(s, *b)?;
 
@@ -408,9 +487,20 @@ fn advanced_face(
 
             // Default for lists of contour points
             _ => {
+                contour_starts.push(num_pts);
                 // Record the initial point to close the loop
                 let start = num_pts;
+
                 for pt in bound_contours {
+                    if is_revolution {
+                        bbox_min.x = bbox_min.x.min(pt.x);
+                        bbox_min.y = bbox_min.y.min(pt.y);
+                        bbox_min.z = bbox_min.z.min(pt.z);
+                        bbox_max.x = bbox_max.x.max(pt.x);
+                        bbox_max.y = bbox_max.y.max(pt.y);
+                        bbox_max.z = bbox_max.z.max(pt.z);
+                    }
+
                     // The contour marches forward!
                     edges.push((num_pts, num_pts + 1));
 
@@ -422,6 +512,7 @@ fn advanced_face(
                     });
                     num_pts += 1;
                 }
+
                 // The last point is a duplicate, because it closes the
                 // contours, so we skip it here and reattach the contour to
                 // the start.
@@ -435,12 +526,23 @@ fn advanced_face(
         }
     }
 
+    if is_revolution {
+        debug!(
+            "Revolution contour bbox: min={:?} max={:?} num_pts={} num_edges={} num_contours={}",
+            bbox_min,
+            bbox_max,
+            num_pts,
+            edges.len(),
+            contour_starts.len()
+        );
+    }
+
     // We inject Stiner points based on the surface type to improve curvature,
     // e.g. for spherical sections.  However, we don't want triagulation to
     // _fail_ due to these points, so if that happens, we nuke the point (by
     // assigning it to the first point in the list, which causes it to get
     // deduplicated), then retry.
-    let mut pts = surf.lower_verts(&mut mesh.verts[v_start..])?;
+    let mut pts = surf.lower_verts_with_contours(&mut mesh.verts[v_start..], &contour_starts)?;
     let bonus_points = pts.len();
     surf.add_steiner_points(&mut pts, &mut mesh.verts);
     let result = std::panic::catch_unwind(|| {
@@ -571,6 +673,16 @@ fn get_surface(s: &StepFile, surf: ap214::Surface) -> Result<Surface, Error> {
             let curve = extrusion_curve(s, e.swept_curve)?;
             Ok(Surface::new_linear_extrusion(curve, dir_unit))
         }
+        Entity::SurfaceOfRevolution(r) => {
+            let (axis_origin, axis) = axis1_placement(s, r.axis_position);
+            if axis.norm() <= std::f64::EPSILON {
+                return Err(Error::CouldNotLower);
+            }
+            let axis_unit = axis.normalize();
+
+            let curve = extrusion_curve(s, r.swept_curve)?;
+            Ok(Surface::new_revolution(curve, axis_origin, axis_unit))
+        }
         Entity::BSplineSurfaceWithKnots(b) => {
             // TODO: make KnotVector::from_multiplicies accept iterators?
             let u_knots: Vec<f64> = b.u_knots.iter().map(|k| k.0).collect();
@@ -684,6 +796,25 @@ fn extrusion_curve(s: &StepFile, curve_id: ap214::Curve) -> Result<ExtrusionCurv
             }
 
             let control_points_list = control_points_1d(s, &c.control_points_list);
+            debug!(
+                "Swept curve BSplineCurveWithKnots id={:?} degree={} closed={:?} self_intersect={:?}",
+                curve_id,
+                c.degree,
+                c.closed_curve.0,
+                c.self_intersect.0
+            );
+            debug!(
+                "  knots={:?}",
+                c.knots.iter().map(|k| k.0).collect::<Vec<f64>>()
+            );
+            debug!(
+                "  multiplicities={:?}",
+                c.knot_multiplicities
+                    .iter()
+                    .map(|&k| k as i64)
+                    .collect::<Vec<i64>>()
+            );
+            debug_print_vec3("  control_points", &control_points_list);
             let knots: Vec<f64> = c.knots.iter().map(|k| k.0).collect();
             let multiplicities: Vec<usize> = c
                 .knot_multiplicities
@@ -729,17 +860,37 @@ fn extrusion_curve(s: &StepFile, curve_id: ap214::Curve) -> Result<ExtrusionCurv
                 .iter()
                 .map(|&k| k.try_into().expect("Got negative multiplicity"))
                 .collect();
+            debug!(
+                "Swept curve RationalBSpline (ComplexEntity) id={:?} degree={} closed={:?} self_intersect={:?}",
+                curve_id,
+                bspline.degree,
+                bspline.closed_curve.0,
+                bspline.self_intersect.0
+            );
+            debug!("  knots={:?}", knots);
+            debug!("  multiplicities={:?}", multiplicities);
+            debug!(
+                "  weights(n={}) head={:?}",
+                rational.weights_data.len(),
+                &rational.weights_data[..rational.weights_data.len().min(6)]
+            );
             let knot_vec = KnotVector::from_multiplicities(
                 bspline.degree.try_into().expect("Got negative degree"),
                 &knots,
                 &multiplicities,
             );
 
-            let control_points_list = control_points_1d(s, &bspline.control_points_list)
-                .into_iter()
-                .zip(rational.weights_data.iter())
-                .map(|(p, w)| DVec4::new(p.x * w, p.y * w, p.z * w, *w))
-                .collect();
+            let control_points_list: Vec<DVec4> =
+                control_points_1d(s, &bspline.control_points_list)
+                    .into_iter()
+                    .zip(rational.weights_data.iter())
+                    .map(|(p, w)| DVec4::new(p.x * w, p.y * w, p.z * w, *w))
+                    .collect();
+            debug!(
+                "  weighted_control_points(n={}) head={:?}",
+                control_points_list.len(),
+                &control_points_list[..control_points_list.len().min(6)]
+            );
 
             let curve = nurbs::NURBSCurve::new(
                 bspline.closed_curve.0.unwrap() == false,
@@ -757,6 +908,13 @@ fn extrusion_curve(s: &StepFile, curve_id: ap214::Curve) -> Result<ExtrusionCurv
             if dir.norm() <= std::f64::EPSILON {
                 return Err(Error::CouldNotLower);
             }
+            debug!(
+                "Swept curve Line id={:?} origin={:?} dir(raw)={:?} dir(unit)={:?}",
+                curve_id,
+                origin,
+                dir,
+                dir.normalize()
+            );
             ExtrusionCurve::new_line(origin, dir.normalize())
         }
         e => {
@@ -780,8 +938,13 @@ fn face_bound(s: &StepFile, b: FaceBound) -> Result<Vec<DVec3>, Error> {
         Entity::FaceOuterBound(b) => (b.bound, b.orientation),
         e => panic!("Could not get bound from {:?} at {:?}", e, b),
     };
+    debug!(
+        "face_bound={:?} bound={:?} orientation={}",
+        b, bound, orientation
+    );
     match &s[bound] {
         Entity::EdgeLoop(e) => {
+            debug!("  EdgeLoop id={:?} edges={} ", bound, e.edge_list.len());
             let mut d = edge_loop(s, &e.edge_list)?;
             if !orientation {
                 d.reverse()
@@ -948,19 +1111,56 @@ mod tests {
     use super::triangulate;
     use step::step_file::StepFile;
 
+    fn assert_mesh_is_sane(mesh: &crate::mesh::Mesh) {
+        assert!(!mesh.verts.is_empty());
+        assert!(!mesh.triangles.is_empty());
+
+        for v in &mesh.verts {
+            assert!(v.pos.x.is_finite());
+            assert!(v.pos.y.is_finite());
+            assert!(v.pos.z.is_finite());
+            assert!(v.norm.x.is_finite());
+            assert!(v.norm.y.is_finite());
+            assert!(v.norm.z.is_finite());
+        }
+        for t in &mesh.triangles {
+            for idx in t.verts.iter() {
+                assert!((*idx as usize) < mesh.verts.len());
+            }
+        }
+    }
+
     #[test]
     fn triangulates_surface_of_linear_extrusion_example() {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("examples")
-            .join("test_spline_extrude_step.step");
+            .join("spline_linear_extrusion.step");
         let data =
             std::fs::read(&path).unwrap_or_else(|e| panic!("Could not read {:?}: {:?}", path, e));
         let flat = StepFile::strip_flatten(&data);
         let step = StepFile::parse(&flat);
 
-        let (mesh, _stats) = triangulate(&step);
-        assert!(mesh.verts.len() > 0);
-        assert!(mesh.triangles.len() > 0);
+        let (mesh, stats) = triangulate(&step);
+        assert_eq!(stats.num_errors, 0);
+        assert_eq!(stats.num_panics, 0);
+        assert_mesh_is_sane(&mesh);
+    }
+
+    #[test]
+    fn triangulates_surface_of_revolution_example() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("examples")
+            .join("spline_revolution.step");
+        let data =
+            std::fs::read(&path).unwrap_or_else(|e| panic!("Could not read {:?}: {:?}", path, e));
+        let flat = StepFile::strip_flatten(&data);
+        let step = StepFile::parse(&flat);
+
+        let (mesh, stats) = triangulate(&step);
+        assert_eq!(stats.num_errors, 0);
+        assert_eq!(stats.num_panics, 0);
+        assert_mesh_is_sane(&mesh);
     }
 }

@@ -1152,7 +1152,7 @@ mod tests {
         let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("examples")
-            .join("spline_revolution.step");
+            .join("spline_revolve.step");
         let data =
             std::fs::read(&path).unwrap_or_else(|e| panic!("Could not read {:?}: {:?}", path, e));
         let flat = StepFile::strip_flatten(&data);
